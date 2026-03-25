@@ -1,0 +1,383 @@
+import pandas as pd
+import numpy as np
+import streamlit as st
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+DATA_PATH = "lab_test_results_public.csv"
+
+STATUS_MAP = {
+    "Low": 0,
+    "Normal": 1,
+    "High": 2
+}
+REVERSE_STATUS_MAP = {v: k for k, v in STATUS_MAP.items()}
+
+
+# -----------------------------
+# DATA PREPROCESSING
+# -----------------------------
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [col.strip() for col in df.columns]
+
+    required_cols = ["Test_Name", "Result", "Min_Reference", "Max_Reference", "Status"]
+    df = df.dropna(subset=required_cols)
+
+    df["Test_Name"] = df["Test_Name"].astype(str).str.strip()
+    df["Status"] = df["Status"].astype(str).str.strip().str.title()
+
+    df["Result"] = pd.to_numeric(df["Result"], errors="coerce")
+    df["Min_Reference"] = pd.to_numeric(df["Min_Reference"], errors="coerce")
+    df["Max_Reference"] = pd.to_numeric(df["Max_Reference"], errors="coerce")
+
+    df = df.dropna(subset=["Result", "Min_Reference", "Max_Reference"])
+    df = df[df["Status"].isin(STATUS_MAP.keys())].copy()
+
+    return df
+
+
+def rule_based_status(row) -> str:
+    result = row["Result"]
+    min_ref = row["Min_Reference"]
+    max_ref = row["Max_Reference"]
+
+    if result < min_ref:
+        return "Low"
+    elif result > max_ref:
+        return "High"
+    else:
+        return "Normal"
+
+
+def rule_based_status_numeric(row) -> int:
+    return STATUS_MAP[rule_based_status(row)]
+
+
+def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    df["Range_Width"] = df["Max_Reference"] - df["Min_Reference"]
+    df["Range_Mid"] = (df["Max_Reference"] + df["Min_Reference"]) / 2.0
+    df["Deviation_From_Mid"] = df["Result"] - df["Range_Mid"]
+
+    df["Normalized_Score"] = np.where(
+        df["Range_Width"] != 0,
+        (df["Result"] - df["Min_Reference"]) / df["Range_Width"],
+        0.0
+    )
+
+    df["Rule_Status"] = df.apply(rule_based_status_numeric, axis=1)
+
+    return df
+
+
+def encode_target(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["Target"] = df["Status"].map(STATUS_MAP)
+    return df
+
+
+# -----------------------------
+# EXPLANATION FUNCTIONS
+# -----------------------------
+def build_patient_friendly_explanation(test_name, result, min_ref, max_ref, predicted_status,
+                                       comment="", followup=""):
+    text = (
+        f"{test_name}: observed value is {result}. "
+        f"The normal reference range is {min_ref} to {max_ref}. "
+        f"The predicted status is {predicted_status}. "
+    )
+
+    if predicted_status == "Low":
+        text += "This means the value is below the normal range. "
+    elif predicted_status == "High":
+        text += "This means the value is above the normal range. "
+    else:
+        text += "This means the value is within the normal range. "
+
+    if isinstance(comment, str) and comment.strip():
+        text += f"Medical comment: {comment.strip()}. "
+
+    if isinstance(followup, str) and followup.strip():
+        text += f"Recommended follow-up: {followup.strip()}. "
+
+    return text
+
+
+def generate_overall_summary(results):
+    if not results:
+        return "No valid lab results were analyzed."
+
+    abnormal = [r for r in results if r["Predicted_Status"] != "Normal"]
+
+    if not abnormal:
+        return "All analyzed test values are within the normal range."
+
+    high_tests = [r["Test_Name"] for r in abnormal if r["Predicted_Status"] == "High"]
+    low_tests = [r["Test_Name"] for r in abnormal if r["Predicted_Status"] == "Low"]
+
+    parts = []
+    if high_tests:
+        parts.append("high values in " + ", ".join(high_tests))
+    if low_tests:
+        parts.append("low values in " + ", ".join(low_tests))
+
+    return "The report indicates " + " and ".join(parts) + ". Please consult a doctor for proper medical interpretation."
+
+
+# -----------------------------
+# MODEL TRAINING
+# -----------------------------
+@st.cache_data
+def load_and_prepare_data():
+    df = pd.read_csv(DATA_PATH)
+    df = clean_dataframe(df)
+    df = add_engineered_features(df)
+    df = encode_target(df)
+    return df
+
+
+@st.cache_resource
+def train_model():
+    df = load_and_prepare_data()
+
+    label_encoder = LabelEncoder()
+    df["Test_Name_Encoded"] = label_encoder.fit_transform(df["Test_Name"])
+
+    feature_cols = [
+        "Result",
+        "Min_Reference",
+        "Max_Reference",
+        "Range_Width",
+        "Range_Mid",
+        "Deviation_From_Mid",
+        "Normalized_Score",
+        "Rule_Status",
+        "Test_Name_Encoded"
+    ]
+
+    X = df[feature_cols]
+    y = df["Target"]
+
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.25, random_state=42, stratify=y
+        )
+    except ValueError:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.25, random_state=42
+        )
+
+    model = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=6,
+        random_state=42
+    )
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+
+    report = classification_report(y_test, y_pred, zero_division=0)
+    matrix = confusion_matrix(y_test, y_pred)
+
+    return model, label_encoder, df, accuracy, report, matrix
+
+
+def predict_single(model, encoder, test_name, result, min_ref, max_ref):
+    if test_name not in encoder.classes_:
+        return None, "Unknown test name."
+
+    test_name_encoded = encoder.transform([test_name])[0]
+
+    row = pd.DataFrame([{
+        "Test_Name": test_name,
+        "Result": result,
+        "Min_Reference": min_ref,
+        "Max_Reference": max_ref,
+        "Status": "Normal"
+    }])
+
+    row = add_engineered_features(row)
+    row["Test_Name_Encoded"] = test_name_encoded
+
+    feature_cols = [
+        "Result",
+        "Min_Reference",
+        "Max_Reference",
+        "Range_Width",
+        "Range_Mid",
+        "Deviation_From_Mid",
+        "Normalized_Score",
+        "Rule_Status",
+        "Test_Name_Encoded"
+    ]
+
+    pred_num = model.predict(row[feature_cols])[0]
+    ml_status = REVERSE_STATUS_MAP[pred_num]
+
+    # Hybrid safety check
+    rule_status = rule_based_status({
+        "Result": result,
+        "Min_Reference": min_ref,
+        "Max_Reference": max_ref
+    })
+
+    final_status = rule_status if ml_status != rule_status else ml_status
+    return final_status, None
+
+
+# -----------------------------
+# STREAMLIT UI
+# -----------------------------
+def main():
+    st.set_page_config(page_title="Medical Report Simplifier", layout="wide")
+    st.title("Medical Report Simplifier and Abnormality Detection System")
+
+    try:
+        model, encoder, df, accuracy, report, matrix = train_model()
+    except FileNotFoundError:
+        st.error("CSV file not found. Please keep 'lab_test_results_public.csv' in the same folder as app.py")
+        return
+    except Exception as e:
+        st.error(f"Error loading dataset or training model: {e}")
+        return
+
+    st.write("This app predicts whether a lab test result is Low, Normal, or High and explains it in simple English.")
+
+    st.subheader("Model Performance")
+    st.write(f"Accuracy: **{accuracy * 100:.2f}%**")
+
+    with st.expander("See Classification Report"):
+        st.text(report)
+
+    with st.expander("See Confusion Matrix"):
+        st.write(matrix)
+
+    test_names = sorted(df["Test_Name"].unique().tolist())
+
+    st.markdown("---")
+    st.subheader("Single Test Prediction")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        selected_test = st.selectbox("Select Test Name", test_names)
+        result = st.number_input("Enter Result", value=0.0, step=0.1)
+        min_ref = st.number_input("Enter Min Reference", value=0.0, step=0.1)
+
+    with col2:
+        max_ref = st.number_input("Enter Max Reference", value=1.0, step=0.1)
+
+        sample_rows = df[df["Test_Name"] == selected_test]
+        sample_comment = sample_rows["Comment"].dropna().iloc[0] if "Comment" in df.columns and not sample_rows["Comment"].dropna().empty else ""
+        sample_followup = sample_rows["Recommended_Followup"].dropna().iloc[0] if "Recommended_Followup" in df.columns and not sample_rows["Recommended_Followup"].dropna().empty else ""
+
+    if st.button("Predict Status"):
+        if min_ref >= max_ref:
+            st.error("Min Reference must be less than Max Reference.")
+        else:
+            predicted_status, err = predict_single(
+                model, encoder, selected_test, result, min_ref, max_ref
+            )
+
+            if err:
+                st.error(err)
+            else:
+                if predicted_status == "High":
+                    st.error(f"Predicted Status: {predicted_status}")
+                elif predicted_status == "Low":
+                    st.info(f"Predicted Status: {predicted_status}")
+                else:
+                    st.success(f"Predicted Status: {predicted_status}")
+
+                explanation = build_patient_friendly_explanation(
+                    test_name=selected_test,
+                    result=result,
+                    min_ref=min_ref,
+                    max_ref=max_ref,
+                    predicted_status=predicted_status,
+                    comment=sample_comment,
+                    followup=sample_followup
+                )
+
+                st.subheader("Patient-Friendly Explanation")
+                st.write(explanation)
+
+                st.warning("This project is for educational use only and does not replace a doctor's advice.")
+
+    st.markdown("---")
+    st.subheader("Batch Test Summary")
+
+    num_rows = st.number_input("How many test rows?", min_value=1, max_value=10, value=3, step=1)
+    batch_rows = []
+
+    for i in range(num_rows):
+        st.markdown(f"**Test Row {i + 1}**")
+        c1, c2, c3, c4 = st.columns(4)
+
+        with c1:
+            t_name = st.selectbox(f"Test Name {i + 1}", test_names, key=f"name_{i}")
+        with c2:
+            t_result = st.number_input(f"Result {i + 1}", value=0.0, step=0.1, key=f"result_{i}")
+        with c3:
+            t_min = st.number_input(f"Min Ref {i + 1}", value=0.0, step=0.1, key=f"min_{i}")
+        with c4:
+            t_max = st.number_input(f"Max Ref {i + 1}", value=1.0, step=0.1, key=f"max_{i}")
+
+        batch_rows.append({
+            "Test_Name": t_name,
+            "Result": t_result,
+            "Min_Reference": t_min,
+            "Max_Reference": t_max
+        })
+
+    if st.button("Generate Batch Summary"):
+        results = []
+
+        for row in batch_rows:
+            if row["Min_Reference"] >= row["Max_Reference"]:
+                continue
+
+            pred_status, err = predict_single(
+                model,
+                encoder,
+                row["Test_Name"],
+                row["Result"],
+                row["Min_Reference"],
+                row["Max_Reference"]
+            )
+
+            if err:
+                continue
+
+            results.append({
+                "Test_Name": row["Test_Name"],
+                "Result": row["Result"],
+                "Min_Reference": row["Min_Reference"],
+                "Max_Reference": row["Max_Reference"],
+                "Predicted_Status": pred_status
+            })
+
+        if not results:
+            st.error("No valid rows found.")
+        else:
+            result_df = pd.DataFrame(results)
+            st.dataframe(result_df, use_container_width=True)
+
+            summary = generate_overall_summary(results)
+            st.subheader("Overall Summary")
+            st.info(summary)
+
+            st.warning("This project is for educational use only and does not replace a doctor's advice.")
+
+
+if __name__ == "__main__":
+    main()
